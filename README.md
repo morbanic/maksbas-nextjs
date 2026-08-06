@@ -16,6 +16,18 @@ in-app messaging — the parts of OneSignal you actually use.
 npm install maksbas-nextjs drizzle-orm
 ```
 
+Straight from GitHub works too — `dist/` is not committed, so npm builds the
+package from source during install via the `prepare` script:
+
+```bash
+npm install github:USER/maksbas-nextjs drizzle-orm     # default branch
+npm install github:USER/maksbas-nextjs#v0.1.0          # pin to a tag
+```
+
+The one thing that breaks this is `npm install --ignore-scripts` (or a CI that
+sets it globally) — `prepare` never runs and the package lands without `dist/`.
+Allow scripts for this dependency, or install from a published tarball.
+
 `drizzle-orm` is a peer dependency — the package uses whichever version and
 driver your app already has (node-postgres, postgres.js, Neon, PGlite).
 
