@@ -1,0 +1,11 @@
+# Without this file npm falls back to .gitignore when packing, and `dist/` is
+# ignored there — which would ship an empty package on `npm install github:...`.
+# The `files` field in package.json is the real allowlist; this file only exists
+# to stop that fallback.
+
+node_modules/
+test/
+src/
+*.tsbuildinfo
+.env
+.env.*
