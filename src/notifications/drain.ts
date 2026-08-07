@@ -2,6 +2,7 @@ import { and, asc, eq, gt, inArray, isNull, lt, or, sql } from 'drizzle-orm'
 import type { ResolvedConfig } from '../config.js'
 import {
   type Notification,
+  type NotificationStatus,
   UNFINISHED_STATUSES,
   devices,
   notifications,
@@ -24,6 +25,15 @@ export interface DrainOptions {
   maxNotifications?: number
   /** Overrides the configured time budget for this call. */
   timeBudgetMs?: number
+  /**
+   * Work on this notification and nothing else.
+   *
+   * `POST /notifications` uses it to give the row it just created a head start.
+   * Without it the inline drain would claim whatever is *oldest*, so a single
+   * stalled notification at the head of the queue makes every send deliver the
+   * previous one.
+   */
+  notificationId?: string
 }
 
 export interface DrainReport {
@@ -57,7 +67,10 @@ export async function drainOnce(
 ): Promise<DrainReport> {
   const budget = options.timeBudgetMs ?? config.timeBudgetMs
   const deadline = Date.now() + budget
-  const maxNotifications = options.maxNotifications ?? 10
+  const target = options.notificationId ?? null
+  // Targeting one row means exactly one round of the loop — a second round would
+  // only ever re-claim the same notification.
+  const maxNotifications = target ? 1 : (options.maxNotifications ?? 10)
 
   const fcm =
     options.fcm ??
@@ -76,15 +89,13 @@ export async function drainOnce(
   }
 
   while (Date.now() < deadline && report.processed < maxNotifications) {
-    const claimed = await claimNotification(config)
+    const claimed = await claimNotification(config, target)
 
     if (!claimed) {
       // Nothing claimable. Either everything is done, or someone else holds the
-      // only outstanding lease — very different situations for the caller.
-      if (await hasUnfinishedWork(config)) {
-        report.hasMore = true
-        report.blocked = true
-      }
+      // lease we wanted — very different situations for the caller.
+      report.hasMore = await hasUnfinishedWork(config)
+      report.blocked = report.hasMore && (await isClaimedElsewhere(config, target))
       return report
     }
 
@@ -106,40 +117,88 @@ export async function drainOnce(
 }
 
 /**
- * Takes exclusive ownership of one unfinished notification.
+ * Takes exclusive ownership of one unfinished notification — the oldest free
+ * one, or `target` specifically.
  *
- * `FOR UPDATE SKIP LOCKED` plus the lease is what keeps the three drain triggers
- * — inline, self-chain and cron — from sending the same batch three times.
+ * This is a single `UPDATE`, not a transaction, because `neon-http` — one of the
+ * most common ways to reach Postgres from a Next.js app — sends every statement
+ * as its own HTTP request and throws outright on `db.transaction()`. A lone
+ * statement is atomic anyway, and that is all the claim needs: two workers
+ * racing for the same row serialise on the row lock, and the loser re-evaluates
+ * `WHERE` against the winner's committed lease and matches nothing.
+ *
+ * `FOR UPDATE SKIP LOCKED` in the subquery is what stops a contended row from
+ * blocking the queue: a second worker skips past it to the next free
+ * notification instead of stalling on the head of the list.
  */
-async function claimNotification(config: ResolvedConfig): Promise<Notification | null> {
-  return config.db.transaction(async (tx) => {
-    const [row] = await tx
-      .select()
-      .from(notifications)
-      .where(
-        and(
-          inArray(notifications.status, [...UNFINISHED_STATUSES]),
-          or(isNull(notifications.leaseUntil), lt(notifications.leaseUntil, new Date())),
-        ),
-      )
-      .orderBy(asc(notifications.createdAt))
-      .limit(1)
-      .for('update', { skipLocked: true })
+async function claimNotification(
+  config: ResolvedConfig,
+  target: string | null = null,
+): Promise<Notification | null> {
+  const free = and(
+    inArray(notifications.status, [...UNFINISHED_STATUSES]),
+    or(isNull(notifications.leaseUntil), lt(notifications.leaseUntil, new Date())),
+  )
 
-    if (!row) return null
+  // `status` and `started_at` are computed from the row's current values so the
+  // claim needs no prior read: a resumed `retrying` row keeps its status, and a
+  // resumed send keeps the timestamp of when it first started.
+  const claim = {
+    status: sql<NotificationStatus>`case when ${notifications.status} = 'pending' then 'sending' else ${notifications.status} end`,
+    leaseUntil: new Date(Date.now() + LEASE_MS),
+    startedAt: sql<Date>`coalesce(${notifications.startedAt}, now())`,
+  }
 
-    const [claimed] = await tx
+  if (target) {
+    const [claimed] = await config.db
       .update(notifications)
-      .set({
-        status: row.status === 'pending' ? 'sending' : row.status,
-        leaseUntil: new Date(Date.now() + LEASE_MS),
-        startedAt: row.startedAt ?? new Date(),
-      })
-      .where(eq(notifications.id, row.id))
+      .set(claim)
+      .where(and(eq(notifications.id, target), free))
       .returning()
-
     return claimed ?? null
-  })
+  }
+
+  const oldestFree = config.db
+    .select({ id: notifications.id })
+    .from(notifications)
+    .where(free)
+    .orderBy(asc(notifications.createdAt))
+    .limit(1)
+    .for('update', { skipLocked: true })
+
+  const [claimed] = await config.db
+    .update(notifications)
+    .set(claim)
+    .where(sql`${notifications.id} = (${oldestFree})`)
+    .returning()
+
+  return claimed ?? null
+}
+
+/**
+ * Whether the work we failed to claim is held by another worker rather than
+ * simply finished. Callers use it to decide against chaining — the holder of the
+ * lease will chain itself, and racing it just burns an invocation.
+ */
+async function isClaimedElsewhere(
+  config: ResolvedConfig,
+  target: string | null,
+): Promise<boolean> {
+  // Untargeted, the claim already looked at every unfinished row and found none
+  // free, so whatever is left over is by definition leased.
+  if (!target) return true
+
+  const [row] = await config.db
+    .select({ status: notifications.status, leaseUntil: notifications.leaseUntil })
+    .from(notifications)
+    .where(eq(notifications.id, target))
+    .limit(1)
+
+  if (!row) return false
+  if (!UNFINISHED_STATUSES.includes(row.status as (typeof UNFINISHED_STATUSES)[number])) {
+    return false
+  }
+  return row.leaseUntil !== null && row.leaseUntil.getTime() > Date.now()
 }
 
 interface ProcessResult {

@@ -27,6 +27,11 @@
       "types": "./dist/schema.d.ts",
       "import": "./dist/schema.js",
       "require": "./dist/schema.cjs"
+    },
+    "./ui": {
+      "types": "./dist/ui.d.ts",
+      "import": "./dist/ui.js",
+      "require": "./dist/ui.cjs"
     }
   },
   "scripts": {

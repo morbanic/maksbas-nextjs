@@ -108,6 +108,67 @@ long-lived process instead.
 
 ---
 
+## Dashboard
+
+A second, optional route gives you a UI for devices and sent notifications.
+
+```ts
+// app/admin/maksbas/[[...path]]/route.ts
+import { createAdminHandler } from "maksbas-nextjs/ui";
+import { db } from "@/lib/db";
+
+const admin = createAdminHandler({
+  db,
+  publicKey: process.env.MAKSBAS_PUBLIC_KEY!,
+  secretKey: process.env.MAKSBAS_SECRET_KEY!,
+  fcm: { serviceAccount: process.env.FCM_SERVICE_ACCOUNT_JSON! },
+  password: process.env.MAKSBAS_ADMIN_PASSWORD,
+});
+
+export const { GET, POST, PATCH, DELETE } = admin;
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+```
+
+Open `/admin/maksbas`. That is the whole installation — the page is a single
+HTML document with its CSS and JS inlined, so there is nothing to add to
+`public/`, no bundler config, and no component to import.
+
+Mounted anywhere else, pass `adminPath` to match:
+
+```ts
+createAdminHandler({ ...config, adminPath: "/dash/push" });
+```
+
+### What it does
+
+| Tab             | What you can do                                                                                    |
+| --------------- | -------------------------------------------------------------------------------------------------- |
+| `Notifications` | Every send with status, audience, sent/failed and delivered/opened. Resume a stalled one, delete a finished one. |
+| `Devices`       | Search by id, token, model or attribute; filter active/inactive; edit attributes; deactivate; delete. |
+| `Send`          | Compose a notification, target everyone / a saved segment / a filter, and size the audience before sending. |
+
+Sends go through exactly the same code path as `POST /notifications`, so a
+notification composed here behaves identically to one sent from your own server.
+
+### Access
+
+| Option                 | Default        | Notes                                                       |
+| ---------------------- | -------------- | ----------------------------------------------------------- |
+| `password`             | the secret key | Set `MAKSBAS_ADMIN_PASSWORD` — the secret key is also what your servers authenticate with, and this one gets typed into a browser. |
+| `sessionMaxAgeSeconds` | `43200` (12h)  | Rotating the secret key invalidates every live session.     |
+
+Signing in sets an `HttpOnly`, `SameSite=Lax` cookie holding a signed expiry and
+nothing else. **The secret key never reaches the browser** — the page only ever
+calls endpoints that hold it server-side. Writes additionally require a header a
+cross-site form cannot set, and the page is served `no-store` and `noindex`.
+
+The dashboard is one password in front of your whole device registry. Put it
+behind your existing auth middleware too if you have one.
+
+---
+
 ## Sending
 
 From your own code, no HTTP:
@@ -241,17 +302,54 @@ serverless function timeout.
 
 So a send is a resumable cursor walk:
 
-1. `POST /notifications` writes the row and drains for `inlineDrainMs` (3s by
-   default). **Small audiences finish here** and never touch the cron.
-2. If work remains, the request hands off to `/cron/drain` and returns `202`.
-3. Each drain claims a notification with `FOR UPDATE SKIP LOCKED` plus a
-   60-second lease, sends batches of 500, and persists a cursor after each one.
+1. `POST /notifications` writes the row and drains **that row** for
+   `inlineDrainMs` (3s by default). **Small audiences finish here** and never
+   touch the cron.
+2. If work remains — for this notification or any other — the request hands off
+   to `/cron/drain` and returns `202`.
+3. Each drain claims a notification with a 60-second lease, sends batches of
+   500, and persists a cursor after each one.
 4. Out of time, it releases the lease and hands off again.
 5. Cron is the recovery net: if a function is killed between batches, the lease
    lapses and the next tick picks up at the cursor.
 
 Being killed at any point costs at most one batch of duplicate work, never a
 lost audience.
+
+The inline drain in step 1 is pinned to the notification that was just created.
+A drain that simply takes the *oldest* unfinished row instead — which is what
+the cron does, correctly — turns one stalled notification at the head of the
+queue into an off-by-one: every send delivers the previous message.
+
+### Claiming, without transactions
+
+The claim is a single `UPDATE` whose `WHERE` re-checks the lease, with a
+`FOR UPDATE SKIP LOCKED` subquery picking the row:
+
+```sql
+UPDATE maksbas_notifications SET lease_until = now() + interval '60 seconds', ...
+WHERE id = (SELECT id FROM maksbas_notifications
+            WHERE status IN ('pending','sending','retrying')
+              AND (lease_until IS NULL OR lease_until < now())
+            ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
+```
+
+One statement is atomic on its own, so this needs no `BEGIN`. That matters
+because **`neon-http` has no transaction support at all** — it sends every
+statement as its own HTTP request and `db.transaction()` throws. Two workers
+racing for the same row serialise on the row lock, and the loser re-evaluates
+`WHERE` against the winner's committed lease and claims nothing. `SKIP LOCKED`
+is what sends it to the *next* free notification rather than stalling on a
+contended one.
+
+Every driver works, including the HTTP ones:
+
+```ts
+import { drizzle } from "drizzle-orm/neon-http";
+import { neon } from "@neondatabase/serverless";
+
+export const db = drizzle(neon(process.env.DATABASE_URL!));
+```
 
 ### Failure handling
 
@@ -294,11 +392,37 @@ exists.
 | `GET POST`       | `/segments`          | List / create                     |
 | `GET PUT DELETE` | `/segments/:name`    | Read / update / delete            |
 
-### Cron (auth: cron secret)
+### Cron (auth: cron secret, or the secret key)
 
 | Method       | Path          |
 | ------------ | ------------- |
 | `GET` `POST` | `/cron/drain` |
+
+The secret key is accepted here as well. Without that, a deployment that never
+set `CRON_SECRET` has no credential to self-chain with, and an interrupted send
+sits unfinished until someone triggers a drain by hand.
+
+### Dashboard (auth: session cookie)
+
+Mounted separately — see [Dashboard](#dashboard). The page is served at the
+mount point; everything below it is what the page itself calls.
+
+| Method   | Path                            | Purpose                       |
+| -------- | ------------------------------- | ----------------------------- |
+| `GET`    | `/session`                      | Is this browser signed in     |
+| `POST`   | `/session`                      | Sign in with the password     |
+| `DELETE` | `/session`                      | Sign out                      |
+| `GET`    | `/api/overview`                 | Counters for the header       |
+| `GET`    | `/api/devices`                  | `?q=&status=&limit=&offset=`  |
+| `PATCH`  | `/api/devices/:id`              | Replace attributes, toggle active |
+| `DELETE` | `/api/devices/:id`              | Unregister                    |
+| `GET`    | `/api/notifications`            | Sends with delivery numbers   |
+| `POST`   | `/api/notifications`            | Compose and send              |
+| `GET`    | `/api/notifications/:id`        | One send in full              |
+| `POST`   | `/api/notifications/:id/resume` | Push a stalled send along     |
+| `DELETE` | `/api/notifications/:id`        | Delete a finished send        |
+| `GET`    | `/api/segments`                 | Feeds the audience picker     |
+| `POST`   | `/api/audience`                 | Size a filter before sending  |
 
 ---
 
@@ -329,10 +453,12 @@ maksbas_events         id, notification_id, device_id, type,
 npm test
 ```
 
-68 tests against a real Postgres 16 running in WASM (`@electric-sql/pglite`) —
+100 tests against a real Postgres 16 running in WASM (`@electric-sql/pglite`) —
 no Docker, no CI service container. Covers the filter compiler including the
 non-numeric-value case, device auth, attribute merging, the cursor walk across
-batch boundaries, token deactivation, retry rounds, and lease handling.
+batch boundaries, token deactivation, retry rounds, lease handling, the
+transaction-free claim, the targeted inline drain, and the dashboard's session
+and CSRF guards.
 
 The Android side has no automated coverage — see the `react-native-maksbas`
 README for the manual checklist.

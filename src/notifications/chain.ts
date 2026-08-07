@@ -10,20 +10,24 @@ const HANDOFF_TIMEOUT_MS = 1000
  * function instance to have *started*. Waiting for its response would just chain
  * two timeouts together.
  *
- * Returns false when self-chaining isn't possible (no base URL or no cron
- * secret), in which case the cron is the only thing that will finish the send —
- * worth knowing, since on Vercel's Hobby plan that means up to a day.
+ * Returns false when self-chaining isn't possible (no base URL), in which case
+ * the cron is the only thing that will finish the send — worth knowing, since on
+ * Vercel's Hobby plan that means up to a day.
  */
 export async function triggerDrain(config: ResolvedConfig): Promise<boolean> {
   if (!config.selfChain) return false
-  if (!config.baseUrl || !config.cronSecret) return false
+  if (!config.baseUrl) return false
+
+  // The drain endpoint takes either credential. Falling back to the secret key
+  // keeps self-chaining alive on deployments that never configured a cron.
+  const credential = config.cronSecret ?? config.secretKey
 
   const url = `${config.baseUrl}${config.basePath}/cron/drain`
 
   try {
     await fetch(url, {
       method: 'POST',
-      headers: { authorization: `Bearer ${config.cronSecret}` },
+      headers: { authorization: `Bearer ${credential}` },
       signal: AbortSignal.timeout(HANDOFF_TIMEOUT_MS),
     })
     return true

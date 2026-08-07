@@ -5,6 +5,7 @@ export default defineConfig({
     index: 'src/index.ts',
     server: 'src/server.ts',
     schema: 'src/db/schema.ts',
+    ui: 'src/ui/index.ts',
   },
   format: ['esm', 'cjs'],
   dts: true,

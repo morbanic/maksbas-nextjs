@@ -60,18 +60,29 @@ export function requireSecretKey(request: Request, config: ResolvedConfig): void
   }
 }
 
+/**
+ * Guards `/cron/drain`.
+ *
+ * The secret key is accepted alongside the cron secret: it is already a
+ * superuser credential, and without it a deployment that never set `cronSecret`
+ * has no way to self-chain — an interrupted send would then sit unfinished until
+ * someone triggers a drain by hand.
+ */
 export function requireCronSecret(request: Request, config: ResolvedConfig): void {
-  if (!config.cronSecret) {
-    throw new ApiError(
-      'forbidden',
-      'Cron endpoint is disabled because `cronSecret` is not configured',
-    )
-  }
   const token = bearerToken(request) ?? request.headers.get('x-cron-secret')
-  if (!token || !timingSafeEqual(token, config.cronSecret)) {
-    throw new ApiError('unauthorized', 'Missing or invalid cron secret')
-  }
-  // The secret key is a superuser credential; allow it to trigger a drain too.
+  if (!token) throw new ApiError('unauthorized', 'Missing cron secret')
+
+  const accepted = [config.cronSecret, config.secretKey].filter(
+    (candidate): candidate is string => Boolean(candidate),
+  )
+  // Every candidate is compared, so the reply takes the same time whether the
+  // first one matched or none did.
+  const matched = accepted.reduce(
+    (found, candidate) => timingSafeEqual(token, candidate) || found,
+    false,
+  )
+
+  if (!matched) throw new ApiError('unauthorized', 'Missing or invalid cron secret')
 }
 
 /**

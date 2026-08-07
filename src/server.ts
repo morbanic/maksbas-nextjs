@@ -78,11 +78,14 @@ export function createServerClient(config: MaksbasConfig | ResolvedConfig) {
 
       if (!created) throw new Error('[maksbas] failed to create notification')
 
+      // Pinned to the row we just created — see the same call in
+      // `routes/notifications.ts` for why draining "one notification" is not
+      // the same thing as draining *this* notification.
       const report =
         resolved.inlineDrainMs > 0
           ? await drainOnce(resolved, {
               timeBudgetMs: resolved.inlineDrainMs,
-              maxNotifications: 1,
+              notificationId: created.id,
             })
           : { hasMore: true, blocked: false }
 

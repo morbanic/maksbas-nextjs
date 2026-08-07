@@ -33,7 +33,22 @@ export async function createNotification(
   requireSecretKey(request, config)
 
   const body = await readJson<CreateNotificationBody>(request)
+  const { notification, handedOff } = await queueNotification(config, body)
 
+  return json({ ...serialise(notification), handedOff }, 202)
+}
+
+/**
+ * Validates, writes and starts a notification.
+ *
+ * Split out of the route so the admin dashboard queues sends through exactly the
+ * same path — including the head start and the hand-off — instead of growing a
+ * second, subtly different copy of it.
+ */
+export async function queueNotification(
+  config: ResolvedConfig,
+  body: CreateNotificationBody,
+): Promise<{ notification: Notification; handedOff: boolean }> {
   const title = requireString(body.title, 'title', { maxLength: 200 })
   const text = requireString(body.body, 'body', { maxLength: 2000 })
   const image = optionalString(body.image, 'image', 2048)
@@ -67,11 +82,16 @@ export async function createNotification(
 
   // Give it a head start inside this request. Small audiences finish here and
   // never involve the cron at all.
+  //
+  // `notificationId` pins the drain to the row we just wrote. Draining "one
+  // notification" without it claims the *oldest* unfinished one instead, so a
+  // single stalled row at the head of the queue turns every send into a delivery
+  // of the previous one.
   let report = { hasMore: true, blocked: false }
   if (config.inlineDrainMs > 0) {
     report = await drainOnce(config, {
       timeBudgetMs: config.inlineDrainMs,
-      maxNotifications: 1,
+      notificationId: created.id,
     })
   }
 
@@ -85,15 +105,12 @@ export async function createNotification(
     .where(eq(notifications.id, created.id))
     .limit(1)
 
-  return json(
-    {
-      ...serialise(current ?? created),
-      // Surfaced so a misconfigured deployment is visible from the response
-      // instead of showing up as a notification that never arrives.
-      handedOff: report.hasMore ? handedOff : false,
-    },
-    202,
-  )
+  return {
+    notification: current ?? created,
+    // Surfaced so a misconfigured deployment is visible from the response
+    // instead of showing up as a notification that never arrives.
+    handedOff: report.hasMore ? handedOff : false,
+  }
 }
 
 async function resolveAudience(
@@ -213,7 +230,7 @@ export async function cronDrain(request: Request, config: ResolvedConfig): Promi
   return json(report)
 }
 
-function serialise(notification: Notification) {
+export function serialise(notification: Notification) {
   const { retryIds, leaseUntil, ...rest } = notification
   return { ...rest, pendingRetries: retryIds.length }
 }

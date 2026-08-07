@@ -271,4 +271,85 @@ describe('drainOnce — claiming work', () => {
 
     expect((await load(id)).status).toBe('completed')
   })
+
+  it('claims without opening a transaction', async () => {
+    await seedDevices(config, 1)
+    await queue()
+
+    // `neon-http` sends every statement as its own HTTP request and throws on
+    // `transaction()`. Standing in for it here so a reintroduced transaction
+    // fails the suite instead of only failing in production.
+    const httpOnlyDb = new Proxy(config.db, {
+      get(target, property, receiver) {
+        if (property === 'transaction') {
+          return () => {
+            throw new Error('No transactions support in neon-http driver')
+          }
+        }
+        return Reflect.get(target, property, receiver)
+      },
+    })
+
+    const report = await drainOnce({ ...config, db: httpOnlyDb }, { fcm: fakeFcm() })
+
+    expect(report.sent).toBe(1)
+  })
+})
+
+describe('drainOnce — targeting one notification', () => {
+  it('sends the notification it was given, not the oldest one queued', async () => {
+    await seedDevices(config, 1)
+
+    // A notification stuck at the head of the queue — a send that died before
+    // finishing, which is exactly what a failed claim used to leave behind.
+    const stuck = await queue()
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    const fresh = await queue()
+
+    const fcm = fakeFcm()
+    await drainOnce(config, { fcm, notificationId: fresh })
+
+    expect((await load(fresh)).status).toBe('completed')
+    // Untargeted, this drain would have picked `stuck` and the caller would
+    // have received the previous notification instead of the one just sent.
+    expect((await load(stuck)).status).toBe('pending')
+  })
+
+  it('reports the backlog as remaining work so the caller still chains', async () => {
+    await seedDevices(config, 1)
+    await queue()
+    const fresh = await queue()
+
+    const report = await drainOnce(config, { fcm: fakeFcm(), notificationId: fresh })
+
+    expect(report.processed).toBe(1)
+    expect(report.hasMore).toBe(true)
+    expect(report.blocked).toBe(false)
+  })
+
+  it('does not chain when the target is already leased by another worker', async () => {
+    await seedDevices(config, 1)
+    const id = await queue()
+
+    await config.db
+      .update(notifications)
+      .set({ status: 'sending', leaseUntil: new Date(Date.now() + 60_000) })
+      .where(eq(notifications.id, id))
+
+    const fcm = fakeFcm()
+    const report = await drainOnce(config, { fcm, notificationId: id })
+
+    expect(fcm.calls).toHaveLength(0)
+    expect(report).toMatchObject({ hasMore: true, blocked: true })
+  })
+
+  it('is a no-op once the target has completed', async () => {
+    await seedDevices(config, 1)
+    const id = await queue()
+
+    await drainOnce(config, { fcm: fakeFcm(), notificationId: id })
+    const second = await drainOnce(config, { fcm: fakeFcm(), notificationId: id })
+
+    expect(second).toMatchObject({ processed: 0, hasMore: false, blocked: false })
+  })
 })
