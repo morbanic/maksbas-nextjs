@@ -70,6 +70,7 @@ async function sendOne({
       android: {
         priority: 'high',
       },
+      apns: buildApns(data),
       data,
     },
   }
@@ -121,6 +122,35 @@ async function sendOne({
     return { status: 'retryable', deviceId: item.deviceId, code, message }
   }
   return { status: 'failed', deviceId: item.deviceId, code, message }
+}
+
+/**
+ * The iOS half of the same message.
+ *
+ * iOS does not wake an app to draw a data-only message the way Android's
+ * messaging service does — it delivers it silently, if at all. So iOS gets an
+ * `aps.alert` and the system draws it. FCM applies the `apns` block only to
+ * APNs tokens, which is why Android stays data-only and keeps drawing its own.
+ *
+ * The `mb_` keys still ride along as custom keys in the APNs payload; the iOS
+ * SDK reads them for taps and deeplinks exactly as Android does.
+ */
+export function buildApns(data: FcmData) {
+  return {
+    headers: {
+      'apns-push-type': 'alert',
+      'apns-priority': '10',
+    },
+    payload: {
+      aps: {
+        alert: {
+          title: data.mb_title ?? '',
+          body: data.mb_body ?? '',
+        },
+        sound: 'default',
+      },
+    },
+  }
 }
 
 interface FcmErrorPayload {

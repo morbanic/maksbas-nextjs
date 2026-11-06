@@ -1,6 +1,6 @@
 {
   "name": "maksbas-nextjs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drop-in push notification backend for Next.js — device registry, key:value attributes, segmentation, FCM HTTP v1 delivery.",
   "license": "MIT",
   "type": "module",
